@@ -77,6 +77,8 @@ def pytest_addoption(parser):
         default=None
     )
 
+    group.addoption('--testmon-cov', help="Save coverage in coverage.py format")
+
     parser.addini("run_variant_expression", "run variant expression",
                   default='')
 
@@ -98,7 +100,7 @@ def init_testmon_data(config, read_source=True):
                                    variant=variant)
         testmon_data.read_data()
         if read_source:
-            testmon_data.read_source()
+            testmon_data.read_source(wholeFiles=True)
         config.testmon_data = testmon_data
 
 

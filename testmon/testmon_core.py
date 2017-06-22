@@ -5,12 +5,15 @@ except ImportError:
     import ConfigParser as configparser
 import hashlib
 import json
-import os
+import os, os.path
+import errno
 import random
 import sqlite3
 import sys
 import textwrap
 import zlib
+import io
+import contextlib
 
 import coverage
 
@@ -41,13 +44,13 @@ def flip_dictionary(node_data):
     return files
 
 
-def unaffected(node_data, changed_files):
+def unaffected(node_data, changed_files, wholeFiles):
     file_data = flip_dictionary(node_data)
     unaffected_nodes = dict(node_data)
     unaffected_files = set(file_data)
     for file in set(changed_files) & set(file_data):
         for nodeid, checksums in file_data[file].items():
-            if set(checksums) - set(changed_files[file].checksums):
+            if wholeFiles or (set(checksums) - set(changed_files[file].checksums)):
                 affected = set(unaffected_nodes.pop(nodeid, []))
                 unaffected_files = unaffected_files - affected
     return unaffected_nodes, unaffected_files
@@ -88,15 +91,6 @@ class Testmon(object):
             subprocess_rc.write(rc_content)
         os.environ['COVERAGE_PROCESS_START'] = self.sub_cov_file + "_rc"
 
-    def track_dependencies(self, callable_to_track, testmon_data, rootdir, nodeid):
-        self.start()
-        try:
-            callable_to_track()
-        except:
-            raise
-        finally:
-            self.stop_and_save(testmon_data, rootdir, nodeid)
-
     def start(self):
         self.cov.erase()
         self.cov.start()
@@ -109,7 +103,8 @@ class Testmon(object):
         if hasattr(self, 'sub_cov_file'):
             self.cov.combine()
 
-        testmon_data.set_dependencies(nodeid, testmon_data.get_nodedata(nodeid, self.cov.get_data(), rootdir), result)
+        covdata = self.cov.get_data()
+        testmon_data.set_dependencies(nodeid, testmon_data.get_nodedata(nodeid, covdata, rootdir), covdata, result)
 
     def close(self):
         if hasattr(self, 'sub_cov_file'):
@@ -191,11 +186,22 @@ class SourceTree():
             self.changed_files[filename] = parse_file(filename=filename, rootdir=self.rootdir, source_code=code)
         return self.changed_files[filename]
 
-
+def mkdir_p(dirpath):
+    ''' Verify that the directory given exists, and if not, create it.  Returns dirpath.
+    '''
+    try:
+        os.makedirs(dirpath)
+    except OSError as exc:  # Python >2.5
+        if exc.errno == errno.EEXIST and os.path.isdir(dirpath):
+            pass
+        else:
+            raise
+    return dirpath
+    
 class TestmonData(object):
 
     # If you change the SQLlite schema, you should bump this number
-    DATA_VERSION = 1
+    DATA_VERSION = 2
     _DATA_VERSION_KEY = '__data_version'
 
     def __init__(self, rootdir, variant=None):
@@ -205,9 +211,10 @@ class TestmonData(object):
         self.init_connection()
         self.node_data = {}
         self.reports = defaultdict(lambda: [])
+        self.covdata_cumulative = coverage.CoverageData()
 
     def init_connection(self):
-        self.datafile = os.path.join(self.rootdir, '.testmondata')
+        self.datafile = os.path.join(mkdir_p(os.environ.get('CACHE_DIR') or self.rootdir), '.testmondata')
         self.connection = None
 
         new_db = not os.path.exists(self.datafile)
@@ -285,6 +292,7 @@ class TestmonData(object):
               name TEXT,
               result TEXT,
               failed BIT,
+              covdata TEXT,              
               PRIMARY KEY (variant, name))
 """)
         self.connection.execute("""
@@ -304,6 +312,7 @@ class TestmonData(object):
             if hasattr(self, 'source_tree'):
                 self._write_attribute('mtimes', self.source_tree.mtimes)
                 self._write_attribute('file_checksums', self.source_tree.checksums)
+        self.covdata_cumulative.write_file('.coverage.cumulative')
 
     def collect_garbage(self, removed_nodeids):
         for removed_nodeid in removed_nodeids:
@@ -340,25 +349,47 @@ class TestmonData(object):
             result[relfilename] = checksum_coverage(self.source_tree.get_file(relfilename).blocks, [1])
         return result
 
-    def set_dependencies(self, nodeid, nodedata, result=[]):
+    def _covdata2str(self, covdata):
+        f = io.StringIO()
+        covdata.write_fileobj(f)
+        with contextlib.closing(f):
+            return f.getvalue()
+
+    def _str2covdata(self, s):
+        f = io.StringIO(s)
+        covdata = coverage.CoverageData()
+        with contextlib.closing(f):
+            covdata.read_fileobj(f)
+            return covdata
+
+    def set_dependencies(self, nodeid, nodedata, covdata, result=[]):
+
+        self.covdata_cumulative.update(covdata)
+
         with self.connection as con:
             outcome = bool([True for r in result if r.get('outcome') == u'failed'])
             con.execute("INSERT OR REPLACE INTO "
                         "node "
-                        "VALUES (?, ?, ?, ?)",
-                        (self.variant, nodeid, json.dumps(result) if outcome else '', outcome))
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (self.variant, nodeid, json.dumps(result) if outcome else '', outcome, 
+                         self._covdata2str(covdata)))
             con.executemany("INSERT INTO node_file VALUES (?, ?, ?, ?)",
                             [(self.variant, nodeid, filename, json.dumps(nodedata[filename])) for filename in nodedata])
 
-    def read_source(self):
+    def read_source(self, wholeFiles):
         mtimes = self._fetch_attribute('mtimes', default={})
         checksums = self._fetch_attribute('file_checksums', default={})
 
         self.source_tree = SourceTree(rootdir=self.rootdir, mtimes=mtimes, checksums=checksums)
-        self.compute_unaffected(self.source_tree.get_changed_files())
+        self.compute_unaffected(self.source_tree.get_changed_files(), wholeFiles)
 
-    def compute_unaffected(self, changed_files):
-        self.unaffected_nodeids, self.unaffected_files = unaffected(self.node_data, changed_files)
+    def compute_unaffected(self, changed_files, wholeFiles):
+        self.unaffected_nodeids, self.unaffected_files = unaffected(self.node_data, changed_files, wholeFiles)
+
+        for nid in self.unaffected_nodeids:
+            for row in self.connection.execute('SELECT covdata FROM node WHERE variant=? AND name=?',
+                                               (self.variant, nid)):
+                self.covdata_cumulative.update(self._str2covdata(row[0]))
 
         # possible data structures
         # nodeid1 -> [filename -> [block_a, block_b]]
